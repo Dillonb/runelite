@@ -32,6 +32,9 @@ import com.google.common.collect.Multiset;
 import com.google.inject.Provides;
 import java.awt.event.KeyEvent;
 import java.text.ParseException;
+import java.util.Comparator;
+import java.util.TreeSet;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.annotation.Nullable;
@@ -66,6 +69,7 @@ import net.runelite.client.input.KeyManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.util.QuantityFormatter;
+import org.apache.commons.lang3.StringUtils;
 
 @PluginDescriptor(
 	name = "Bank",
@@ -84,6 +88,7 @@ public class BankPlugin extends Plugin
 	private static final Pattern VALUE_SEARCH_PATTERN = Pattern.compile("^(?<mode>ge|ha|alch)?" +
 		" *(((?<op>[<>=]|>=|<=) *(?<num>" + NUMBER_REGEX + "))|" +
 		"((?<num1>" + NUMBER_REGEX + ") *- *(?<num2>" + NUMBER_REGEX + ")))$", Pattern.CASE_INSENSITIVE);
+	private static final Pattern TOP_N_SEARCH_PATTERN = Pattern.compile("^(?<mode>ge|ha|alch|)\\s?top\\s*(?<num>\\d+)$", Pattern.CASE_INSENSITIVE);
 
 	@Inject
 	private Client client;
@@ -105,6 +110,9 @@ public class BankPlugin extends Plugin
 
 	private boolean forceRightClickFlag;
 	private Multiset<Integer> itemQuantities; // bank item quantities for bank value search
+	private TreeSet<Item> itemsByGEValue; // bank items by GE value for top n search
+	private TreeSet<Item> itemsByHAValue; // bank items by HA value for top n search
+	private TreeSet<Item> itemsByValue; // bank items by whichever value is higher for top n search
 	private String searchString;
 
 	private final KeyListener searchHotkeyListener = new KeyListener()
@@ -158,6 +166,9 @@ public class BankPlugin extends Plugin
 		clientThread.invokeLater(() -> bankSearch.reset(false));
 		forceRightClickFlag = false;
 		itemQuantities = null;
+		itemsByValue = null;
+		itemsByGEValue = null;
+		itemsByHAValue = null;
 		searchString = null;
 	}
 
@@ -208,7 +219,7 @@ public class BankPlugin extends Plugin
 				int itemId = intStack[intStackSize - 1];
 				String search = stringStack[stringStackSize - 1];
 
-				if (valueSearch(itemId, search))
+				if (valueSearch(itemId, search) || topNSearch(itemId, search))
 				{
 					// return true
 					intStack[intStackSize - 2] = 1;
@@ -320,6 +331,9 @@ public class BankPlugin extends Plugin
 		if (containerId == InventoryID.BANK.getId())
 		{
 			itemQuantities = null;
+			itemsByValue = null;
+			itemsByGEValue = null;
+			itemsByHAValue = null;
 		}
 		else if (containerId == InventoryID.SEED_VAULT.getId() && config.seedVaultValue())
 		{
@@ -408,6 +422,32 @@ public class BankPlugin extends Plugin
 		return itemContainer.getItems();
 	}
 
+	boolean topNSearch(final int itemId, final String search) {
+		final Matcher matcher = TOP_N_SEARCH_PATTERN.matcher(search);
+		if (!matcher.matches())
+		{
+			return false;
+		}
+
+		hydrateItemsByValue();
+
+		String mode = matcher.group("mode");
+		int num = Integer.parseInt(matcher.group("num"));
+
+		TreeSet<Item> items;
+
+		if (StringUtils.isBlank(mode)) {
+			items = itemsByValue;
+		} else if ("ge".equalsIgnoreCase(mode)) {
+			items = itemsByGEValue;
+		} else if ("ha".equalsIgnoreCase(mode)) {
+			items = itemsByHAValue;
+		} else {
+			return false;
+		}
+
+		return items.stream().limit(num).anyMatch(item -> itemId == item.getId());
+	}
 
 	@VisibleForTesting
 	boolean valueSearch(final int itemId, final String str)
@@ -503,6 +543,43 @@ public class BankPlugin extends Plugin
 			}
 		}
 		return set;
+	}
+
+	private TreeSet<Item> getBankItemsByValue(Function<Item, Long> getValue)
+	{
+		ItemContainer itemContainer = client.getItemContainer(InventoryID.BANK);
+		TreeSet<Item> items = new TreeSet<>(Comparator.comparing(getValue).reversed());
+
+		if (itemContainer != null)
+		{
+			for (Item item : itemContainer.getItems()) {
+				ItemComposition itemComposition = itemManager.getItemComposition(item.getId());
+				if (item.getId() != ItemID.BANK_FILLER && itemComposition.isTradeable() && item.getQuantity() > 0)
+				{
+					items.add(item);
+				}
+			}
+		}
+
+		return items;
+	}
+
+	private void hydrateItemsByValue() {
+		if (itemsByValue == null) {
+			itemsByValue = getBankItemsByValue((item) -> {
+				long gePrice = (long)itemManager.getItemPrice(item.getId()) * item.getQuantity();
+				long haPrice = (long)getHaPrice(item.getId()) * item.getQuantity();
+
+				return Math.max(gePrice, haPrice);
+			});
+		}
+
+		if (itemsByGEValue == null) {
+			itemsByGEValue = getBankItemsByValue((item) -> (long)itemManager.getItemPrice(item.getId()) * item.getQuantity());
+		}
+		if (itemsByHAValue == null) {
+			itemsByHAValue = getBankItemsByValue((item) -> (long)getHaPrice(item.getId()) * item.getQuantity());
+		}
 	}
 
 	@Nullable
